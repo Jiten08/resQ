@@ -3,7 +3,7 @@ import { View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, Image,
 import * as Location from 'expo-location';
 import Constants from 'expo-constants';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Search, MapPin, FileText, CheckCircle, Users, PhoneCall, Clock } from 'lucide-react-native';
+import { Search, MapPin, FileText, CheckCircle, Users, PhoneCall, Clock, X } from 'lucide-react-native';
 import MapView, { Marker } from 'react-native-maps';
 import MapViewDirections from 'react-native-maps-directions';
 import { COLORS, SIZES, SHADOWS } from '../theme/theme';
@@ -119,6 +119,7 @@ export default function AlertsScreen() {
   };
 
   useEffect(() => {
+    console.log("AlertsScreen Mounted. Google API Key detected:", GOOGLE_API_KEY ? "YES (ends with " + GOOGLE_API_KEY.slice(-5) + ")" : "NO (undefined)");
     (async () => {
       let { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') {
@@ -154,6 +155,20 @@ export default function AlertsScreen() {
               value={searchQuery}
               onChangeText={handleSearchChange}
             />
+            {searchQuery.length > 0 && (
+              <TouchableOpacity
+                onPress={() => {
+                  setSearchQuery('');
+                  setSuggestions([]);
+                  setSearchedLocation(null);
+                  setSelectedHospital(null);
+                  setRouteInfo(null);
+                }}
+                style={styles.clearSearchInput}
+              >
+                <X color={COLORS.textSecondary} size={18} />
+              </TouchableOpacity>
+            )}
           </View>
 
           {/* Autocomplete Dropdown List */}
@@ -236,7 +251,7 @@ export default function AlertsScreen() {
                 {/* Map Directions */}
                 {selectedHospital && GOOGLE_API_KEY && (
                   <MapViewDirections
-                    origin={searchedLocation || {
+                    origin={{
                       latitude: location.coords.latitude,
                       longitude: location.coords.longitude,
                     }}
@@ -396,6 +411,11 @@ const styles = StyleSheet.create({
     marginLeft: 8,
     fontSize: 14,
     color: COLORS.text,
+  },
+  clearSearchInput: {
+    padding: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   suggestionsContainer: {
     position: 'absolute',
