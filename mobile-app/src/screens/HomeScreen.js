@@ -7,6 +7,7 @@ import { Accelerometer } from 'expo-sensors';
 import * as ImagePicker from 'expo-image-picker';
 import { Audio } from 'expo-av';
 import * as Location from 'expo-location';
+import * as Speech from 'expo-speech';
 import MapView, { Marker } from 'react-native-maps';
 import MapViewDirections from 'react-native-maps-directions';
 import Constants from 'expo-constants';
@@ -73,6 +74,7 @@ export default function HomeScreen() {
     return () => {
       console.log("[HomeScreen] Cleaning up voice assistant resources on unmount...");
       isListeningLoopActiveRef.current = false;
+      Speech.stop();
       if (soundRef.current) {
         soundRef.current.unloadAsync().catch(() => {});
       }
@@ -270,6 +272,7 @@ export default function HomeScreen() {
     isListeningLoopActiveRef.current = false;
     setAssistantMessage("Initialising audio recorder...");
 
+    Speech.stop();
     if (soundRef.current) {
       try {
         await soundRef.current.unloadAsync();
@@ -328,6 +331,7 @@ export default function HomeScreen() {
         playsInSilentModeIOS: true,
         shouldRouteThroughEarpieceAndroid: false,
         playThroughEarpieceAndroid: false,
+        staysActiveInBackground: false,
       });
 
       console.log("[HomeScreen] Uploading audio to ResQ API:", audioUri);
@@ -345,8 +349,8 @@ export default function HomeScreen() {
       if (response && response.steps && response.steps.length > 0) {
         setSteps(response.steps);
         setCurrentStepIndex(0);
-        // Text-to-Speech skipped per request
-        // playStepTTS(response.steps[0], 0);
+        // Automatically play first step
+        playStepTTS(response.steps[0], 0);
       } else {
         setAssistantMessage("Could not parse emergency guidance. Please end assistant and try again.");
       }
@@ -362,6 +366,7 @@ export default function HomeScreen() {
     setIsListeningForCommand(false);
     setIsPlayingTTS(true);
 
+    Speech.stop();
     if (soundRef.current) {
       try {
         await soundRef.current.stopAsync();
@@ -371,34 +376,59 @@ export default function HomeScreen() {
     }
 
     try {
-      // Force audio output to route directly through speakerphone (disable allowsRecordingIOS)
+      // Force audio output to route directly through speakerphone (disable allowsRecordingIOS temporarily)
+      // We also temporarily disable background activity to force OS to re-evaluate audio routing.
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: false,
         playsInSilentModeIOS: true,
         shouldRouteThroughEarpieceAndroid: false,
         playThroughEarpieceAndroid: false,
+        staysActiveInBackground: false,
       });
 
-      // Build dynamic HTTP streaming URL based on developer machine's resolved host IP
-      const streamUrl = `http://${hostIp}:8000/api/tts_stream?text=${encodeURIComponent(text)}&language_code=en-IN`;
-      console.log(`[HomeScreen] Streaming Step ${index + 1} TTS audio from:`, streamUrl);
+      let voiceId = undefined;
+      try {
+        const voices = await Speech.getAvailableVoicesAsync();
+        const indianVoices = voices.filter(v => 
+          v.language.toLowerCase().startsWith('en-in') || 
+          v.language.toLowerCase().startsWith('en_in')
+        );
+        
+        // Look for "female", "veena" (iOS), "voice 1" or a network voice
+        const preferred = indianVoices.find(v => 
+          v.name.toLowerCase().includes('female') ||
+          v.identifier.toLowerCase().includes('female') ||
+          v.name.toLowerCase().includes('veena') ||
+          v.name.toLowerCase().includes('1') ||
+          v.identifier.toLowerCase().includes('1') ||
+          v.identifier.toLowerCase().includes('network') 
+        );
+        
+        if (preferred) {
+          voiceId = preferred.identifier;
+        } else if (indianVoices.length > 0) {
+          voiceId = indianVoices[0].identifier;
+        }
+      } catch (err) {
+        console.warn("[HomeScreen] Failed to fetch voices:", err);
+      }
 
-      const { sound } = await Audio.Sound.createAsync(
-        { uri: streamUrl },
-        { shouldPlay: true }
-      );
-      soundRef.current = sound;
-
-      sound.setOnPlaybackStatusUpdate((status) => {
-        if (status.didJustFinish) {
+      Speech.speak(text, {
+        language: 'en-IN',
+        voice: voiceId,
+        onDone: () => {
           console.log(`[HomeScreen] Step ${index + 1} speech finished. Activating commands listener...`);
           setIsPlayingTTS(false);
-          // Trigger loop to listen for commands
+          startCommandListeningLoop(index);
+        },
+        onError: (error) => {
+          console.error("[HomeScreen] playStepTTS failed:", error);
+          setIsPlayingTTS(false);
           startCommandListeningLoop(index);
         }
       });
     } catch (e) {
-      console.error("[HomeScreen] playStepTTS streaming failed:", e);
+      console.error("[HomeScreen] playStepTTS failed:", e);
       setIsPlayingTTS(false);
       startCommandListeningLoop(index);
     }
@@ -467,6 +497,7 @@ export default function HomeScreen() {
           playsInSilentModeIOS: true,
           shouldRouteThroughEarpieceAndroid: false,
           playThroughEarpieceAndroid: false,
+          staysActiveInBackground: false,
         });
 
         // Check command via FastAPI
@@ -507,7 +538,7 @@ export default function HomeScreen() {
     if (steps && indexVal < steps.length - 1) {
       const nextIndex = indexVal + 1;
       setCurrentStepIndex(nextIndex);
-      // playStepTTS(steps[nextIndex], nextIndex);
+      playStepTTS(steps[nextIndex], nextIndex);
     }
   };
 
@@ -515,7 +546,7 @@ export default function HomeScreen() {
     if (steps && indexVal > 0) {
       const prevIndex = indexVal - 1;
       setCurrentStepIndex(prevIndex);
-      // playStepTTS(steps[prevIndex], prevIndex);
+      playStepTTS(steps[prevIndex], prevIndex);
     }
   };
 
@@ -529,6 +560,8 @@ export default function HomeScreen() {
     setCapturedImageUri(null);
     setIsAssistantActive(false);
     handleCancelFall();
+    
+    Speech.stop();
 
     if (soundRef.current) {
       try {
@@ -793,7 +826,7 @@ export default function HomeScreen() {
                 {/* Repeat TTS Button */}
                 <TouchableOpacity 
                   style={styles.actionBtnCenter}
-                  // onPress={() => playStepTTS(steps[currentStepIndex], currentStepIndex)}
+                  onPress={() => playStepTTS(steps[currentStepIndex], currentStepIndex)}
                 >
                   <View style={styles.actionBtnCenterInner}>
                     <Text style={styles.actionBtnCenterText}>Repeat Speech</Text>
