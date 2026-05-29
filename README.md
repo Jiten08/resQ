@@ -49,15 +49,17 @@ resQlink/
 
 ## Getting Started
 
-### 1. Mobile App
-Navigate to the `mobile-app/` directory and install dependencies:
+To run the full resQLink platform, you will need to start the WebSocket server, the FastAPI backend, the AI Pipeline, and the Expo mobile app.
+
+### 1. WebSocket Server (Emergency Hub)
+Run the root Node.js server which handles emergency socket connections:
 ```bash
-cd mobile-app
 npm install
-npm run start
+npm run server
+# Or alternatively: node server.js
 ```
 
-### 2. Backend
+### 2. Backend (FastAPI)
 Navigate to `backend/` to configure and run the FastAPI server:
 ```bash
 cd backend
@@ -65,13 +67,32 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate  # Or .venv\Scripts\activate on Windows
 pip install -r requirements.txt
+
+# Start the server
+uvicorn main:app --reload
+# Or using fastapi cli: fastapi dev main.py
 ```
 
 ### 3. AI Pipeline
-Navigate to `ai-pipeline/` to set up pipeline tools:
+Navigate to `ai-pipeline/` to set up and run the pipeline tools:
 ```bash
 cd ai-pipeline
+# Setup virtual environment and install dependencies
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # Or .venv\Scripts\activate on Windows
 pip install -r requirements.txt
+
+# Run the main pipeline
+python main_pipeline.py
+```
+
+### 4. Mobile App (Expo)
+Navigate to the `mobile-app/` directory, install dependencies, and start the Expo app:
+```bash
+cd mobile-app
+npm install
+
+# Start the Expo development server
+npm run start
+# Press 'a' to open on Android, 'i' to open on iOS, or scan the QR code with the Expo Go app.
 ```
