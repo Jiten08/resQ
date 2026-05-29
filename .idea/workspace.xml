@@ -6,11 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="be4c3341-814d-4101-881e-9b1b3c72071b" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/backend/requirements.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/mobile-app/src/screens/AlertsScreen.js" beforeDir="false" afterPath="$PROJECT_DIR$/mobile-app/src/screens/AlertsScreen.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/mobile-app/src/screens/HomeScreen.js" beforeDir="false" afterPath="$PROJECT_DIR$/mobile-app/src/screens/HomeScreen.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/mobile-app/src/services/MockAssistantAPI.js" beforeDir="false" afterPath="$PROJECT_DIR$/mobile-app/src/services/MockAssistantAPI.js" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
