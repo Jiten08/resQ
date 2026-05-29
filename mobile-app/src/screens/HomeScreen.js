@@ -1,12 +1,15 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Animated, PanResponder, Dimensions, Image } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Animated, PanResponder, Dimensions, Image, ActivityIndicator, Linking, Platform } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Bell, Clock, Activity, Check, User, ChevronRight, AlertTriangle, Mic, Camera, MapPin } from 'lucide-react-native';
+import { Bell, Clock, Activity, Check, User, ChevronRight, AlertTriangle, Mic, Camera, MapPin, X } from 'lucide-react-native';
 import { COLORS, SIZES, SHADOWS } from '../theme/theme';
 import { Accelerometer } from 'expo-sensors';
 import * as ImagePicker from 'expo-image-picker';
 import { Audio } from 'expo-av';
 import * as Location from 'expo-location';
+import MapView, { Marker } from 'react-native-maps';
+import MapViewDirections from 'react-native-maps-directions';
+import Constants from 'expo-constants';
 import { MockAssistantAPI } from '../services/MockAssistantAPI';
 import { useProfile } from '../context/ProfileContext';
 
@@ -26,12 +29,96 @@ export default function HomeScreen() {
   const [escalationData, setEscalationData] = useState(null);
   const isAccidentTriggeredRef = useRef(isAccidentTriggered);
   
+  // Peer coordination states
+  const [deviceId] = useState(() => Math.random().toString(36).substring(7));
+  const [peerFallAlert, setPeerFallAlert] = useState(null);
+  const [peerRouteInfo, setPeerRouteInfo] = useState(null);
+  const [location, setLocation] = useState(null);
+  const wsRef = useRef(null);
+  
+  const GOOGLE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_API_KEY;
+
+  // Dynamically resolve WebSocket URL from Expo dev host IP
+  const manifest = Constants.expoConfig || {};
+  const hostUri = manifest.hostUri;
+  const hostIp = hostUri ? hostUri.split(':')[0] : 'localhost';
+  const WS_URL = `ws://${hostIp}:3000`;
+
   useEffect(() => {
     isAccidentTriggeredRef.current = isAccidentTriggered;
   }, [isAccidentTriggered]);
   
   const KNOB_WIDTH = 44;
   
+  const reportFallToPeers = async () => {
+    try {
+      let currentLoc = { coords: { latitude: 37.78825, longitude: -122.4324 } };
+      try {
+        currentLoc = await Location.getCurrentPositionAsync({});
+      } catch (e) {}
+
+      const payload = {
+        type: 'fall_alert',
+        triggered: true,
+        senderId: deviceId,
+        senderName: profile?.name || 'Jiten',
+        latitude: currentLoc.coords.latitude,
+        longitude: currentLoc.coords.longitude,
+        timestamp: Date.now()
+      };
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(payload));
+        console.log("Fall reported to peers via WebSocket successfully:", payload);
+      } else {
+        console.warn("WebSocket not connected. Fall reported fallback offline.");
+      }
+    } catch (e) {
+      console.warn("Failed to report fall:", e);
+    }
+  };
+
+  const handleCancelFall = async () => {
+    try {
+      const payload = {
+        type: 'clear_alert',
+        triggered: false,
+        senderId: deviceId
+      };
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(payload));
+      }
+    } catch (e) {}
+  };
+
+  const handleAcceptPeerAlert = () => {
+    if (!peerFallAlert) return;
+    const lat = peerFallAlert.latitude;
+    const lng = peerFallAlert.longitude;
+    const name = peerFallAlert.senderName;
+    
+    const scheme = Platform.select({
+      ios: 'maps://app?daddr=',
+      android: 'google.navigation:q='
+    });
+    const url = Platform.select({
+      ios: `${scheme}${lat},${lng}&q=${encodeURIComponent(name)}`,
+      android: `${scheme}${lat},${lng}`
+    });
+
+    Linking.canOpenURL(url).then(supported => {
+      if (supported) {
+        Linking.openURL(url);
+      } else {
+        const webUrl = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
+        Linking.openURL(webUrl);
+      }
+    });
+
+    setPeerFallAlert(null);
+    setPeerRouteInfo(null);
+  };
+
   const triggerAccident = () => {
     setIsAccidentTriggered(true);
     setCountdown(10);
@@ -52,6 +139,62 @@ export default function HomeScreen() {
     return () => subscription && subscription.remove();
   }, []);
 
+  // Set up persistent WebSocket connection and fetch current location
+  useEffect(() => {
+    (async () => {
+      try {
+        let { status } = await Location.requestForegroundPermissionsAsync();
+        if (status === 'granted') {
+          let currentLoc = await Location.getCurrentPositionAsync({});
+          setLocation(currentLoc);
+        }
+      } catch (e) {}
+    })();
+
+    let ws;
+    let reconnectTimer;
+
+    const connectWS = () => {
+      console.log(`Connecting to ResQ WebSocket Relay at: ${WS_URL}`);
+      ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.log('Connected to ResQ Local WebSocket Relay Server');
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data && data.triggered && data.senderId !== deviceId) {
+            setPeerFallAlert(data);
+          } else if (data && !data.triggered) {
+            setPeerFallAlert(null);
+            setPeerRouteInfo(null);
+          }
+        } catch (e) {
+          console.warn('Error parsing WS message:', e);
+        }
+      };
+
+      ws.onclose = () => {
+        console.log('ResQ WS Connection closed, retrying in 3s...');
+        reconnectTimer = setTimeout(connectWS, 3000);
+      };
+
+      ws.onerror = (error) => {
+        console.warn('ResQ WS Error:', error.message);
+      };
+    };
+
+    connectWS();
+
+    return () => {
+      if (ws) ws.close();
+      clearTimeout(reconnectTimer);
+    };
+  }, [deviceId]);
+
   useEffect(() => {
     let timer;
     if (isAccidentTriggered && countdown > 0 && !isCancelled) {
@@ -62,6 +205,7 @@ export default function HomeScreen() {
       setIsAccidentTriggered(false);
       setIsAssistantActive(true);
       startAssistantFlow();
+      reportFallToPeers();
     }
     return () => clearInterval(timer);
   }, [isAccidentTriggered, countdown, isCancelled]);
@@ -141,6 +285,7 @@ export default function HomeScreen() {
             setIsCancelled(true);
             setIsAccidentTriggered(false);
             setShowCancelledOverlay(true);
+            handleCancelFall();
             setTimeout(() => {
               setShowCancelledOverlay(false);
               setIsCancelled(false);
@@ -186,7 +331,10 @@ export default function HomeScreen() {
           </Text>
           <TouchableOpacity 
             style={[styles.miniSosBtn, { backgroundColor: COLORS.text, marginTop: 24, paddingHorizontal: 24, paddingVertical: 12 }]} 
-            onPress={() => setAlertSent(false)}
+            onPress={() => {
+              setAlertSent(false);
+              handleCancelFall();
+            }}
           >
             <Text style={[styles.miniSosText, { fontSize: 16 }]}>I'm Safe Now</Text>
           </TouchableOpacity>
@@ -213,7 +361,10 @@ export default function HomeScreen() {
 
             <TouchableOpacity 
               style={[styles.miniSosBtn, { backgroundColor: 'rgba(255,255,255,0.2)', marginTop: 40, paddingHorizontal: 24, paddingVertical: 12 }]} 
-              onPress={() => setIsAssistantActive(false)}
+              onPress={() => {
+                setIsAssistantActive(false);
+                handleCancelFall();
+              }}
             >
               <Text style={[styles.miniSosText, { fontSize: 16 }]}>End Assistant</Text>
             </TouchableOpacity>
@@ -249,6 +400,7 @@ export default function HomeScreen() {
               onPress={() => {
                 setEscalationData(null);
                 setIsAssistantActive(false);
+                handleCancelFall();
               }}
             >
               <Text style={[styles.miniSosText, { fontSize: 16 }]}>I'm Safe Now</Text>
@@ -378,6 +530,111 @@ export default function HomeScreen() {
         </View>
 
       </ScrollView>
+
+      {peerFallAlert && (
+        <View style={styles.peerFallOverlay}>
+          <SafeAreaView style={{ flex: 1, width: '100%', padding: 20 }}>
+            <View style={styles.peerFallHeader}>
+              <AlertTriangle color="#FF3B30" size={32} />
+              <Text style={styles.peerFallTitle}>CRITICAL ALERT</Text>
+              <Text style={styles.peerFallSubtitle}>
+                {peerFallAlert.senderName} has detected a fall!
+              </Text>
+            </View>
+
+            {/* Interactive Navigation Map */}
+            <View style={styles.peerFallMapContainer}>
+              {location ? (
+                <MapView
+                  style={StyleSheet.absoluteFillObject}
+                  initialRegion={{
+                    latitude: location.coords.latitude,
+                    longitude: location.coords.longitude,
+                    latitudeDelta: 0.04,
+                    longitudeDelta: 0.04,
+                  }}
+                >
+                  {/* Responder Marker */}
+                  <Marker
+                    coordinate={{
+                      latitude: location.coords.latitude,
+                      longitude: location.coords.longitude,
+                    }}
+                    title="You"
+                    pinColor="blue"
+                  />
+
+                  {/* Victim Marker */}
+                  <Marker
+                    coordinate={{
+                      latitude: peerFallAlert.latitude,
+                      longitude: peerFallAlert.longitude,
+                    }}
+                    title={peerFallAlert.senderName}
+                    pinColor="red"
+                  />
+
+                  {/* Routing Directions */}
+                  {GOOGLE_API_KEY && (
+                    <MapViewDirections
+                      origin={{
+                        latitude: location.coords.latitude,
+                        longitude: location.coords.longitude,
+                      }}
+                      destination={{
+                        latitude: peerFallAlert.latitude,
+                        longitude: peerFallAlert.longitude,
+                      }}
+                      apikey={GOOGLE_API_KEY}
+                      strokeWidth={4}
+                      strokeColor="#FF3B30"
+                      onReady={(result) => {
+                        setPeerRouteInfo({
+                          distance: result.distance.toFixed(1),
+                          duration: Math.ceil(result.duration),
+                        });
+                      }}
+                    />
+                  )}
+                </MapView>
+              ) : (
+                <ActivityIndicator size="large" color="#FF3B30" style={{ marginTop: 'auto', marginBottom: 'auto' }} />
+              )}
+
+              {peerRouteInfo && (
+                <View style={styles.peerRouteCard}>
+                  <View style={styles.peerRouteItem}>
+                    <Clock size={16} color="#FF3B30" style={{ marginRight: 4 }} />
+                    <Text style={styles.peerRouteValue}>{peerRouteInfo.duration} min</Text>
+                  </View>
+                  <View style={styles.peerRouteItem}>
+                    <MapPin size={16} color="#007AFF" style={{ marginRight: 4 }} />
+                    <Text style={styles.peerRouteValue}>{peerRouteInfo.distance} km</Text>
+                  </View>
+                </View>
+              )}
+            </View>
+
+            {/* Responder Actions */}
+            <TouchableOpacity
+              style={styles.peerAcceptBtn}
+              onPress={handleAcceptPeerAlert}
+            >
+              <Text style={styles.peerAcceptBtnText}>I'm On My Way</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.peerDismissBtn}
+              onPress={() => {
+                setPeerFallAlert(null);
+                setPeerRouteInfo(null);
+              }}
+            >
+              <Text style={styles.peerDismissBtnText}>Dismiss</Text>
+            </TouchableOpacity>
+          </SafeAreaView>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
@@ -689,5 +946,83 @@ const styles = StyleSheet.create({
     color: COLORS.textLight,
     fontWeight: '800',
     fontSize: 18,
+  },
+  peerFallOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#1C1C1E',
+    zIndex: 1000,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  peerFallHeader: {
+    alignItems: 'center',
+    marginTop: 20,
+    marginBottom: 20,
+  },
+  peerFallTitle: {
+    color: '#FF3B30',
+    fontSize: 24,
+    fontWeight: '900',
+    letterSpacing: 2,
+    marginTop: 8,
+  },
+  peerFallSubtitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+    marginTop: 6,
+    textAlign: 'center',
+  },
+  peerFallMapContainer: {
+    flex: 1,
+    borderRadius: 24,
+    overflow: 'hidden',
+    backgroundColor: '#2C2C2E',
+    marginBottom: 20,
+    position: 'relative',
+  },
+  peerRouteCard: {
+    position: 'absolute',
+    bottom: 16,
+    left: 16,
+    right: 16,
+    backgroundColor: '#1C1C1E',
+    borderRadius: 16,
+    padding: 12,
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    elevation: 5,
+  },
+  peerRouteItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  peerRouteValue: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    fontSize: 14,
+  },
+  peerAcceptBtn: {
+    backgroundColor: '#FF3B30',
+    borderRadius: 16,
+    paddingVertical: 16,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  peerAcceptBtnText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  peerDismissBtn: {
+    backgroundColor: '#2C2C2E',
+    borderRadius: 16,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  peerDismissBtnText: {
+    color: '#AEAEB2',
+    fontSize: 14,
+    fontWeight: '700',
   },
 });

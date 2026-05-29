@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, Image, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, Image, ActivityIndicator, Linking, Platform } from 'react-native';
 import * as Location from 'expo-location';
 import Constants from 'expo-constants';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -18,9 +18,20 @@ export default function AlertsScreen() {
   const [searchedLocation, setSearchedLocation] = useState(null);
   const [selectedHospital, setSelectedHospital] = useState(null);
   const [routeInfo, setRouteInfo] = useState(null);
+  
+  // Peer coordination states
+  const [deviceId] = useState(() => Math.random().toString(36).substring(7));
+  const [peerFallAlert, setPeerFallAlert] = useState(null);
+  const [peerRouteInfo, setPeerRouteInfo] = useState(null);
 
   const mapRef = useRef(null);
   const GOOGLE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_API_KEY;
+
+  // Dynamically resolve WebSocket URL from Expo dev host IP
+  const manifest = Constants.expoConfig || {};
+  const hostUri = manifest.hostUri;
+  const hostIp = hostUri ? hostUri.split(':')[0] : 'localhost';
+  const WS_URL = `ws://${hostIp}:3000`;
 
   const fetchNearbyHospitals = async (lat, lng) => {
     if (!GOOGLE_API_KEY) {
@@ -118,6 +129,34 @@ export default function AlertsScreen() {
     setRouteInfo(null);
   };
 
+  const handleAcceptPeerAlert = () => {
+    if (!peerFallAlert) return;
+    const lat = peerFallAlert.latitude;
+    const lng = peerFallAlert.longitude;
+    const name = peerFallAlert.senderName;
+    
+    const scheme = Platform.select({
+      ios: 'maps://app?daddr=',
+      android: 'google.navigation:q='
+    });
+    const url = Platform.select({
+      ios: `${scheme}${lat},${lng}&q=${encodeURIComponent(name)}`,
+      android: `${scheme}${lat},${lng}`
+    });
+
+    Linking.canOpenURL(url).then(supported => {
+      if (supported) {
+        Linking.openURL(url);
+      } else {
+        const webUrl = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
+        Linking.openURL(webUrl);
+      }
+    });
+
+    setPeerFallAlert(null);
+    setPeerRouteInfo(null);
+  };
+
   useEffect(() => {
     console.log("AlertsScreen Mounted. Google API Key detected:", GOOGLE_API_KEY ? "YES (ends with " + GOOGLE_API_KEY.slice(-5) + ")" : "NO (undefined)");
     (async () => {
@@ -139,6 +178,51 @@ export default function AlertsScreen() {
       }
     })();
   }, []);
+
+  // Set up persistent WebSocket connection
+  useEffect(() => {
+    let ws;
+    let reconnectTimer;
+
+    const connectWS = () => {
+      console.log(`Connecting to ResQ WebSocket Relay from Alerts at: ${WS_URL}`);
+      ws = new WebSocket(WS_URL);
+
+      ws.onopen = () => {
+        console.log('Connected to ResQ Local WebSocket Relay Server (Alerts Screen)');
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data && data.triggered && data.senderId !== deviceId) {
+            setPeerFallAlert(data);
+          } else if (data && !data.triggered) {
+            setPeerFallAlert(null);
+            setPeerRouteInfo(null);
+          }
+        } catch (e) {
+          console.warn('Error parsing WS message:', e);
+        }
+      };
+
+      ws.onclose = () => {
+        console.log('ResQ WS Connection closed on Alerts, retrying in 3s...');
+        reconnectTimer = setTimeout(connectWS, 3000);
+      };
+
+      ws.onerror = (error) => {
+        console.warn('ResQ WS Error on Alerts:', error.message);
+      };
+    };
+
+    connectWS();
+
+    return () => {
+      if (ws) ws.close();
+      clearTimeout(reconnectTimer);
+    };
+  }, [deviceId]);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -375,6 +459,110 @@ export default function AlertsScreen() {
         </View>
 
       </ScrollView>
+
+      {peerFallAlert && (
+        <View style={styles.peerFallOverlay}>
+          <SafeAreaView style={{ flex: 1, width: '100%', padding: 20 }}>
+            <View style={styles.peerFallHeader}>
+              <AlertTriangle color="#FF3B30" size={32} />
+              <Text style={styles.peerFallTitle}>CRITICAL ALERT</Text>
+              <Text style={styles.peerFallSubtitle}>
+                {peerFallAlert.senderName} has detected a fall!
+              </Text>
+            </View>
+
+            {/* Interactive Navigation Map */}
+            <View style={styles.peerFallMapContainer}>
+              {location ? (
+                <MapView
+                  style={StyleSheet.absoluteFillObject}
+                  initialRegion={{
+                    latitude: location.coords.latitude,
+                    longitude: location.coords.longitude,
+                    latitudeDelta: 0.04,
+                    longitudeDelta: 0.04,
+                  }}
+                >
+                  {/* Responder Marker */}
+                  <Marker
+                    coordinate={{
+                      latitude: location.coords.latitude,
+                      longitude: location.coords.longitude,
+                    }}
+                    title="You"
+                    pinColor="blue"
+                  />
+
+                  {/* Victim Marker */}
+                  <Marker
+                    coordinate={{
+                      latitude: peerFallAlert.latitude,
+                      longitude: peerFallAlert.longitude,
+                    }}
+                    title={peerFallAlert.senderName}
+                    pinColor="red"
+                  />
+
+                  {/* Routing Directions */}
+                  {GOOGLE_API_KEY && (
+                    <MapViewDirections
+                      origin={{
+                        latitude: location.coords.latitude,
+                        longitude: location.coords.longitude,
+                      }}
+                      destination={{
+                        latitude: peerFallAlert.latitude,
+                        longitude: peerFallAlert.longitude,
+                      }}
+                      apikey={GOOGLE_API_KEY}
+                      strokeWidth={4}
+                      strokeColor="#FF3B30"
+                      onReady={(result) => {
+                        setPeerRouteInfo({
+                          distance: result.distance.toFixed(1),
+                          duration: Math.ceil(result.duration),
+                        });
+                      }}
+                    />
+                  )}
+                </MapView>
+              ) : (
+                <ActivityIndicator size="large" color="#FF3B30" style={{ marginTop: 'auto', marginBottom: 'auto' }} />
+              )}
+
+              {peerRouteInfo && (
+                <View style={styles.peerRouteCard}>
+                  <View style={styles.peerRouteItem}>
+                    <Clock size={16} color="#FF3B30" style={{ marginRight: 4 }} />
+                    <Text style={styles.peerRouteValue}>{peerRouteInfo.duration} min</Text>
+                  </View>
+                  <View style={styles.peerRouteItem}>
+                    <MapPin size={16} color="#007AFF" style={{ marginRight: 4 }} />
+                    <Text style={styles.peerRouteValue}>{peerRouteInfo.distance} km</Text>
+                  </View>
+                </View>
+              )}
+            </View>
+
+            <TouchableOpacity
+              style={styles.peerAcceptBtn}
+              onPress={handleAcceptPeerAlert}
+            >
+              <Text style={styles.peerAcceptBtnText}>I'm On My Way</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.peerDismissBtn}
+              onPress={() => {
+                setPeerFallAlert(null);
+                setPeerRouteInfo(null);
+              }}
+            >
+              <Text style={styles.peerDismissBtnText}>Dismiss</Text>
+            </TouchableOpacity>
+          </SafeAreaView>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
@@ -628,5 +816,83 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: COLORS.textSecondary,
     lineHeight: 18,
+  },
+  peerFallOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#1C1C1E',
+    zIndex: 1000,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  peerFallHeader: {
+    alignItems: 'center',
+    marginTop: 20,
+    marginBottom: 20,
+  },
+  peerFallTitle: {
+    color: '#FF3B30',
+    fontSize: 24,
+    fontWeight: '900',
+    letterSpacing: 2,
+    marginTop: 8,
+  },
+  peerFallSubtitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+    marginTop: 6,
+    textAlign: 'center',
+  },
+  peerFallMapContainer: {
+    flex: 1,
+    borderRadius: 24,
+    overflow: 'hidden',
+    backgroundColor: '#2C2C2E',
+    marginBottom: 20,
+    position: 'relative',
+  },
+  peerRouteCard: {
+    position: 'absolute',
+    bottom: 16,
+    left: 16,
+    right: 16,
+    backgroundColor: '#1C1C1E',
+    borderRadius: 16,
+    padding: 12,
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    elevation: 5,
+  },
+  peerRouteItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  peerRouteValue: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    fontSize: 14,
+  },
+  peerAcceptBtn: {
+    backgroundColor: '#FF3B30',
+    borderRadius: 16,
+    paddingVertical: 16,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  peerAcceptBtnText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  peerDismissBtn: {
+    backgroundColor: '#2C2C2E',
+    borderRadius: 16,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  peerDismissBtnText: {
+    color: '#AEAEB2',
+    fontSize: 14,
+    fontWeight: '700',
   },
 });
