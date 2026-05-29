@@ -1,18 +1,122 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, Image, ActivityIndicator } from 'react-native';
 import * as Location from 'expo-location';
 import Constants from 'expo-constants';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Search, MapPin, FileText, CheckCircle, Users, PhoneCall, Clock } from 'lucide-react-native';
+import MapView, { Marker } from 'react-native-maps';
+import MapViewDirections from 'react-native-maps-directions';
 import { COLORS, SIZES, SHADOWS } from '../theme/theme';
 
 export default function AlertsScreen() {
   const [location, setLocation] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
   const [loadingMap, setLoadingMap] = useState(true);
+  const [hospitals, setHospitals] = useState([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [suggestions, setSuggestions] = useState([]);
+  const [searchedLocation, setSearchedLocation] = useState(null);
+  const [selectedHospital, setSelectedHospital] = useState(null);
+  const [routeInfo, setRouteInfo] = useState(null);
 
-  const GEOAPIFY_KEY = process.env.EXPO_PUBLIC_GEOAPIFY_KEY
-    
+  const mapRef = useRef(null);
+  const GOOGLE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_API_KEY;
+
+  const fetchNearbyHospitals = async (lat, lng) => {
+    if (!GOOGLE_API_KEY) {
+      console.warn("Google API Key is not set in environment variables!");
+      return;
+    }
+    try {
+      const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lng}&radius=5000&type=hospital&key=${GOOGLE_API_KEY}`;
+      const response = await fetch(url);
+      const data = await response.json();
+      if (data.status === 'OK' && data.results) {
+        const mapped = data.results.map(item => ({
+          id: item.place_id,
+          name: item.name,
+          vicinity: item.vicinity,
+          coordinate: {
+            latitude: item.geometry.location.lat,
+            longitude: item.geometry.location.lng,
+          }
+        }));
+        setHospitals(mapped);
+      } else {
+        console.warn("Google Nearby Search API returned status:", data.status, data.error_message || '');
+      }
+    } catch (err) {
+      console.warn("Error fetching hospitals:", err);
+    }
+  };
+
+  const handleSearchChange = async (text) => {
+    setSearchQuery(text);
+    if (!text || text.length < 3) {
+      setSuggestions([]);
+      return;
+    }
+    if (!GOOGLE_API_KEY) {
+      console.warn("Google API Key is not set in environment variables!");
+      return;
+    }
+    try {
+      const lat = searchedLocation?.latitude || location?.coords?.latitude;
+      const lng = searchedLocation?.longitude || location?.coords?.longitude;
+      const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(text)}&location=${lat},${lng}&radius=10000&key=${GOOGLE_API_KEY}`;
+      const response = await fetch(url);
+      const data = await response.json();
+      if (data.status === 'OK' && data.predictions) {
+        setSuggestions(data.predictions);
+      } else {
+        console.warn("Google Autocomplete API returned status:", data.status, data.error_message || '');
+      }
+    } catch (err) {
+      console.warn("Autocomplete error:", err);
+    }
+  };
+
+  const handleSelectSuggestion = async (suggestion) => {
+    setSearchQuery(suggestion.description);
+    setSuggestions([]);
+    if (!GOOGLE_API_KEY) {
+      console.warn("Google API Key is not set in environment variables!");
+      return;
+    }
+    try {
+      const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${suggestion.place_id}&fields=geometry&key=${GOOGLE_API_KEY}`;
+      const response = await fetch(url);
+      const data = await response.json();
+      if (data.status === 'OK' && data.result?.geometry?.location) {
+        const loc = {
+          latitude: data.result.geometry.location.lat,
+          longitude: data.result.geometry.location.lng,
+        };
+        setSearchedLocation(loc);
+        setSelectedHospital(null);
+        setRouteInfo(null);
+        
+        // Animate map to location
+        mapRef.current?.animateToRegion({
+          ...loc,
+          latitudeDelta: 0.02,
+          longitudeDelta: 0.02,
+        }, 1000);
+
+        // Fetch new nearby hospitals from searched location
+        fetchNearbyHospitals(loc.latitude, loc.longitude);
+      } else {
+        console.warn("Google Place Details API returned status:", data.status, data.error_message || '');
+      }
+    } catch (err) {
+      console.warn("Details API error:", err);
+    }
+  };
+
+  const handleSelectHospital = (hospital) => {
+    setSelectedHospital(hospital);
+    setRouteInfo(null);
+  };
 
   useEffect(() => {
     (async () => {
@@ -26,6 +130,7 @@ export default function AlertsScreen() {
       try {
         let currentLocation = await Location.getCurrentPositionAsync({});
         setLocation(currentLocation);
+        fetchNearbyHospitals(currentLocation.coords.latitude, currentLocation.coords.longitude);
       } catch (error) {
         setErrorMsg('Could not fetch location');
       } finally {
@@ -46,26 +151,151 @@ export default function AlertsScreen() {
               placeholder="Incident Location"
               placeholderTextColor={COLORS.textSecondary}
               style={styles.searchInput}
+              value={searchQuery}
+              onChangeText={handleSearchChange}
             />
           </View>
+
+          {/* Autocomplete Dropdown List */}
+          {suggestions.length > 0 && (
+            <View style={styles.suggestionsContainer}>
+              <ScrollView style={{ maxHeight: 180 }} keyboardShouldPersistTaps="handled">
+                {suggestions.map((item) => (
+                  <TouchableOpacity
+                    key={item.place_id}
+                    style={styles.suggestionItem}
+                    onPress={() => handleSelectSuggestion(item)}
+                  >
+                    <MapPin size={16} color={COLORS.textSecondary} style={{ marginRight: 8 }} />
+                    <Text style={styles.suggestionText} numberOfLines={1}>
+                      {item.description}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            </View>
+          )}
           
           {loadingMap ? (
             <View style={[styles.mapGraphic, { justifyContent: 'center', alignItems: 'center' }]}>
-                            <ActivityIndicator size="large" color={COLORS.primary} />
-                            <Text style={{ marginTop: 10, color: COLORS.textSecondary }}>Locating...</Text>
-                          </View>
-                        ) : AlertsScreen.errorMsg ? (
-                          <View style={[styles.mapGraphic, { justifyContent: 'center', alignItems: 'center', backgroundColor: '#F8D7DA' }]}>
-                            <Text style={{ color: '#721C24', textAlign: 'center', padding: 20 }}>{errorMsg}</Text>
-                          </View>
-                        ) : AlertsScreen.location ? (
-                          <Image
-                            source={{
-                              uri: `https://maps.geoapify.com/v1/staticmap?style=osm-bright-smooth&width=600&height=400&center=lonlat:${location.coords.longitude},${location.coords.latitude}&marker=lonlat:${location.coords.longitude},${location.coords.latitude};color:%23ff0000;size:medium&apikey=${GEOAPIFY_KEY}`,
-                            }}
-                            style={styles.mapGraphic}
-                            resizeMode="cover"
-                          />
+              <ActivityIndicator size="large" color={COLORS.primary} />
+              <Text style={{ marginTop: 10, color: COLORS.textSecondary }}>Locating...</Text>
+            </View>
+          ) : errorMsg ? (
+            <View style={[styles.mapGraphic, { justifyContent: 'center', alignItems: 'center', backgroundColor: '#F8D7DA' }]}>
+              <Text style={{ color: '#721C24', textAlign: 'center', padding: 20 }}>{errorMsg}</Text>
+            </View>
+          ) : location ? (
+            <View style={styles.mapGraphic}>
+              <MapView
+                ref={mapRef}
+                style={StyleSheet.absoluteFillObject}
+                initialRegion={{
+                  latitude: location.coords.latitude,
+                  longitude: location.coords.longitude,
+                  latitudeDelta: 0.02,
+                  longitudeDelta: 0.02,
+                }}
+              >
+                {/* User Current Location Marker */}
+                <Marker
+                  coordinate={{
+                    latitude: location.coords.latitude,
+                    longitude: location.coords.longitude,
+                  }}
+                  title="Your Location"
+                  description="You are here"
+                  pinColor="blue"
+                />
+
+                {/* Searched Location Marker */}
+                {searchedLocation && (
+                  <Marker
+                    coordinate={searchedLocation}
+                    title="Incident Location"
+                    description="Searched position"
+                    pinColor="red"
+                  />
+                )}
+
+                {/* Nearby Hospitals Markers */}
+                {hospitals.map((hospital) => (
+                  <Marker
+                    key={hospital.id}
+                    coordinate={hospital.coordinate}
+                    title={hospital.name}
+                    description={hospital.vicinity}
+                    onPress={() => handleSelectHospital(hospital)}
+                  >
+                    <View style={styles.hospitalMarker}>
+                      <Text style={styles.hospitalMarkerText}>🏥</Text>
+                    </View>
+                  </Marker>
+                ))}
+
+                {/* Map Directions */}
+                {selectedHospital && GOOGLE_API_KEY && (
+                  <MapViewDirections
+                    origin={searchedLocation || {
+                      latitude: location.coords.latitude,
+                      longitude: location.coords.longitude,
+                    }}
+                    destination={selectedHospital.coordinate}
+                    apikey={GOOGLE_API_KEY}
+                    strokeWidth={4}
+                    strokeColor={COLORS.primary}
+                    optimizeWaypoints={true}
+                    onReady={(result) => {
+                      setRouteInfo({
+                        distance: result.distance.toFixed(1),
+                        duration: Math.ceil(result.duration),
+                      });
+                      
+                      // Auto-fit route
+                      mapRef.current?.fitToCoordinates(result.coordinates, {
+                        edgePadding: {
+                          right: 50,
+                          bottom: 50,
+                          left: 50,
+                          top: 100,
+                        },
+                      });
+                    }}
+                    onError={(err) => console.warn(err)}
+                  />
+                )}
+              </MapView>
+
+              {/* Floating Route Card */}
+              {selectedHospital && routeInfo && (
+                <View style={styles.routeCard}>
+                  <View style={styles.routeCardHeader}>
+                    <Text style={styles.routeCardTitle} numberOfLines={1}>
+                      {selectedHospital.name}
+                    </Text>
+                    <TouchableOpacity
+                      onPress={() => {
+                        setSelectedHospital(null);
+                        setRouteInfo(null);
+                      }}
+                      style={styles.routeCardClose}
+                    >
+                      <Text style={styles.routeCardCloseText}>×</Text>
+                    </TouchableOpacity>
+                  </View>
+                  <View style={styles.routeCardBody}>
+                    <View style={styles.routeCardItem}>
+                      <Clock size={16} color={COLORS.primary} style={{ marginRight: 4 }} />
+                      <Text style={styles.routeCardValue}>{routeInfo.duration} min</Text>
+                    </View>
+                    <View style={styles.routeCardItem}>
+                      <MapPin size={16} color={COLORS.info} style={{ marginRight: 4 }} />
+                      <Text style={styles.routeCardValue}>{routeInfo.distance} km</Text>
+                    </View>
+                  </View>
+                </View>
+              )}
+            </View>
           ) : null}
         </View>
 
@@ -167,6 +397,32 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: COLORS.text,
   },
+  suggestionsContainer: {
+    position: 'absolute',
+    top: 68,
+    left: 16,
+    right: 16,
+    backgroundColor: COLORS.surface,
+    borderRadius: 12,
+    ...SHADOWS.medium,
+    zIndex: 100,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#EFEFEF',
+  },
+  suggestionItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#EFEFEF',
+  },
+  suggestionText: {
+    fontSize: 13,
+    color: COLORS.text,
+    flex: 1,
+  },
   mapGraphic: {
     position: 'absolute',
     top: 0,
@@ -174,69 +430,71 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
   },
-  mapGrid: {
-    flex: 1,
-    borderWidth: 20,
-    borderColor: 'transparent',
-    borderTopColor: '#DCE4EC',
-    borderLeftColor: '#DCE4EC',
-    opacity: 0.5,
-  },
-  routeLine: {
-    position: 'absolute',
-    width: 60,
-    height: 100,
-    borderRightWidth: 4,
-    borderTopWidth: 4,
-    borderColor: COLORS.info,
-    top: 100,
-    left: 120,
-    borderTopRightRadius: 20,
-  },
-  mapMarker: {
-    position: 'absolute',
-    width: 40,
-    height: 40,
+  hospitalMarker: {
+    backgroundColor: '#FFFFFF',
+    padding: 6,
     borderRadius: 20,
+    borderWidth: 2,
+    borderColor: '#FF4C4C',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 3,
+    elevation: 4,
     justifyContent: 'center',
     alignItems: 'center',
-    borderWidth: 3,
-    borderColor: COLORS.surface,
-    ...SHADOWS.medium,
   },
-  markerText: {
-    color: COLORS.textLight,
-    fontWeight: '800',
-    fontSize: 16,
+  hospitalMarkerText: {
+    fontSize: 14,
   },
-  markerLabelWrapper: {
+  routeCard: {
     position: 'absolute',
-    top: 105,
-    left: 90,
-    backgroundColor: COLORS.text,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 20,
+    bottom: 12,
+    left: 12,
+    right: 12,
+    backgroundColor: COLORS.surface,
+    borderRadius: 16,
+    padding: 12,
+    ...SHADOWS.medium,
+    borderWidth: 1,
+    borderColor: '#EFEFEF',
+  },
+  routeCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  routeCardTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.text,
+    flex: 1,
+    marginRight: 8,
+  },
+  routeCardClose: {
+    padding: 2,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  routeCardCloseText: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: COLORS.textSecondary,
+    lineHeight: 18,
+  },
+  routeCardBody: {
+    flexDirection: 'row',
+    gap: 16,
+  },
+  routeCardItem: {
     flexDirection: 'row',
     alignItems: 'center',
   },
-  markerLabel: {
-    color: COLORS.textLight,
+  routeCardValue: {
     fontSize: 12,
-    fontWeight: '700',
-  },
-  mapPlaceholderNote: {
-    position: 'absolute',
-    bottom: 16,
-    right: 16,
-    backgroundColor: 'rgba(255,255,255,0.7)',
-    padding: 8,
-    borderRadius: 8,
-  },
-  mapNoteText: {
-    fontSize: 10,
-    color: COLORS.textSecondary,
     fontWeight: '600',
+    color: COLORS.textSecondary,
   },
   sectionHeader: {
     flexDirection: 'row',

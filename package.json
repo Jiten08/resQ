@@ -1,0 +1,11 @@
+{
+  "name": "resq-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "npm run start --prefix mobile-app",
+    "android": "npm run android --prefix mobile-app",
+    "ios": "npm run ios --prefix mobile-app",
+    "web": "npm run web --prefix mobile-app"
+  }
+}
