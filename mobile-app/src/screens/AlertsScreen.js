@@ -3,7 +3,7 @@ import { View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, Image,
 import * as Location from 'expo-location';
 import Constants from 'expo-constants';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Search, MapPin, FileText, CheckCircle, Users, PhoneCall, Clock, X } from 'lucide-react-native';
+import { Search, MapPin, FileText, CheckCircle, Users, PhoneCall, Clock, X, AlertTriangle } from 'lucide-react-native';
 import MapView, { Marker } from 'react-native-maps';
 import MapViewDirections from 'react-native-maps-directions';
 import { COLORS, SIZES, SHADOWS } from '../theme/theme';

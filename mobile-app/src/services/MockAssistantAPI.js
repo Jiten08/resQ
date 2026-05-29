@@ -1,44 +1,149 @@
+import Constants from 'expo-constants';
+import { Platform } from 'react-native';
+
+// Dynamically resolve developer machine's host IP for local network API access
+const manifest = Constants.expoConfig || {};
+const hostUri = manifest.hostUri;
+const hostIp = hostUri ? hostUri.split(':')[0] : 'localhost';
+const API_URL = `http://${hostIp}:8000`;
+
+console.log(`[AssistantAPI] Connecting to FastAPI backend at: ${API_URL}`);
+
 export const MockAssistantAPI = {
-  processAudioStream: async () => {
-    // Simulate network delay for processing audio
-    return new Promise((resolve) => {
-      setTimeout(() => {
-        resolve({
-          text: "I am analyzing the situation. Are there any visible injuries? Please take a photo of the victim so I can assess their condition.",
-          requiresPhoto: true,
-          escalate: false
-        });
-      }, 2000);
-    });
+  /**
+   * Sends phone recorded emergency audio and/or victim photo to the FastAPI backend.
+   * @param {string|null} audioUri - Local phone URI for the recorded wav file.
+   * @param {string|null} imageUri - Local phone URI for the captured photo.
+   * @param {string} languageCode - Target speech/translation language.
+   * @returns {Promise<{steps: string[], detected_text: string, language_code: string}>}
+   */
+  processEmergency: async (audioUri = null, imageUri = null, languageCode = 'en-IN', username = 'User') => {
+    const formData = new FormData();
+    formData.append('language', languageCode);
+    formData.append('username', username);
+
+    if (audioUri) {
+      const audioName = audioUri.split('/').pop() || 'recording.wav';
+      formData.append('audio', {
+        uri: Platform.OS === 'android' ? audioUri : audioUri.replace('file://', ''),
+        type: 'audio/wav',
+        name: audioName,
+      });
+    }
+
+    if (imageUri) {
+      const imageName = imageUri.split('/').pop() || 'photo.jpg';
+      formData.append('image', {
+        uri: Platform.OS === 'android' ? imageUri : imageUri.replace('file://', ''),
+        type: 'image/jpeg',
+        name: imageName,
+      });
+    }
+
+    try {
+      const response = await fetch(`${API_URL}/api/process`, {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'multipart/form-data',
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP Error status ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (e) {
+      console.error("[AssistantAPI] processEmergency failed:", e);
+      throw e;
+    }
   },
 
-  analyzePhoto: async (imageUri) => {
-    // Simulate network delay for analyzing a photo
-    return new Promise((resolve) => {
-      setTimeout(() => {
-        resolve({
-          text: "I've analyzed the photo. The victim appears to be unconscious. This is a critical situation. I am escalating to emergency services and locating the nearest hospital.",
-          escalate: true
-        });
-      }, 3000);
-    });
+  /**
+   * Retrieves Sarvam Text-To-Speech base64 audio representation for a step string.
+   * @param {string} text - First-aid instruction step.
+   * @param {string} languageCode - Target speak language.
+   * @returns {Promise<{audio_content: string}>}
+   */
+  getTTS: async (text, languageCode = 'en-IN') => {
+    try {
+      const response = await fetch(`${API_URL}/api/tts`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({
+          text,
+          language_code: languageCode,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP Error status ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (e) {
+      console.error("[AssistantAPI] getTTS failed:", e);
+      throw e;
+    }
   },
 
-  evaluateEscalation: async (userLocation) => {
-    // Returns mock hospital and route data based on user location
-    return new Promise((resolve) => {
-      setTimeout(() => {
-        resolve({
-          hospital: {
-            name: "St. Jude's Medical Center",
-            address: "101 E Valencia Mesa Dr",
-            latitude: userLocation?.latitude ? userLocation.latitude + 0.01 : 33.924,
-            longitude: userLocation?.longitude ? userLocation.longitude + 0.01 : -117.917,
-          },
-          eta: "5 mins",
-          status: "Ambulance Dispatched"
-        });
-      }, 1500);
+  /**
+   * Uploads a 2-second audio snippet to check for 'next' or 'previous' wake word commands.
+   * @param {string} audioUri - Local phone URI for the captured command audio.
+   * @returns {Promise<{command: string, transcript: string}>}
+   */
+  checkCommand: async (audioUri) => {
+    const formData = new FormData();
+    const audioName = audioUri.split('/').pop() || 'command.wav';
+
+    formData.append('audio', {
+      uri: Platform.OS === 'android' ? audioUri : audioUri.replace('file://', ''),
+      type: 'audio/wav',
+      name: audioName,
     });
+
+    try {
+      const response = await fetch(`${API_URL}/api/check_command`, {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'multipart/form-data',
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP Error status ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (e) {
+      console.error("[AssistantAPI] checkCommand failed:", e);
+      throw e;
+    }
+  },
+
+  /**
+   * Triggers an emergency SMS and optionally logs ambulance call.
+   */
+  callAmbulance: async (username = 'User') => {
+    try {
+      const response = await fetch(`${API_URL}/api/call-ambulance?username=${encodeURIComponent(username)}`, {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+        },
+      });
+      if (!response.ok) throw new Error(`HTTP Error status ${response.status}`);
+      return await response.json();
+    } catch (e) {
+      console.error("[AssistantAPI] callAmbulance failed:", e);
+      throw e;
+    }
   }
 };

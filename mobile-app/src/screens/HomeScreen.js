@@ -24,10 +24,34 @@ export default function HomeScreen() {
   const [showCancelledOverlay, setShowCancelledOverlay] = useState(false);
   const [alertSent, setAlertSent] = useState(false);
   const [isAssistantActive, setIsAssistantActive] = useState(false);
-  const [assistantMessage, setAssistantMessage] = useState("Voice assistant is activating...");
+  const [assistantMessage, setAssistantMessage] = useState("Please attach a photo or record symptoms.");
   const [requiresPhoto, setRequiresPhoto] = useState(false);
   const [escalationData, setEscalationData] = useState(null);
+  
   const isAccidentTriggeredRef = useRef(isAccidentTriggered);
+  const isAssistantActiveRef = useRef(isAssistantActive);
+
+  useEffect(() => {
+    isAccidentTriggeredRef.current = isAccidentTriggered;
+  }, [isAccidentTriggered]);
+
+  useEffect(() => {
+    isAssistantActiveRef.current = isAssistantActive;
+  }, [isAssistantActive]);
+
+  // New Voice Assistant Triage and Step-by-Step Guidance States
+  const [steps, setSteps] = useState(null);
+  const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  const [isPlayingTTS, setIsPlayingTTS] = useState(false);
+  const [isListeningForCommand, setIsListeningForCommand] = useState(false);
+  const [isRecordingInitial, setIsRecordingInitial] = useState(false);
+  const [initialCountdown, setInitialCountdown] = useState(5);
+  const [capturedImageUri, setCapturedImageUri] = useState(null);
+
+  // References to manage asynchronous loops and sound objects cleanly
+  const soundRef = useRef(null);
+  const recordingRef = useRef(null);
+  const isListeningLoopActiveRef = useRef(false);
   
   // Peer coordination states
   const [deviceId] = useState(() => Math.random().toString(36).substring(7));
@@ -44,18 +68,22 @@ export default function HomeScreen() {
   const hostIp = hostUri ? hostUri.split(':')[0] : 'localhost';
   const WS_URL = `ws://${hostIp}:3000`;
 
+
   useEffect(() => {
-    isAccidentTriggeredRef.current = isAccidentTriggered;
-  }, [isAccidentTriggered]);
+    return () => {
+      console.log("[HomeScreen] Cleaning up voice assistant resources on unmount...");
+      isListeningLoopActiveRef.current = false;
+      if (soundRef.current) {
+        soundRef.current.unloadAsync().catch(() => {});
+      }
+    };
+  }, []);
   
   const KNOB_WIDTH = 44;
   
   const reportFallToPeers = async () => {
     try {
-      let currentLoc = { coords: { latitude: 37.78825, longitude: -122.4324 } };
-      try {
-        currentLoc = await Location.getCurrentPositionAsync({});
-      } catch (e) {}
+      let currentLoc = location || { coords: { latitude: 37.78825, longitude: -122.4324 } };
 
       const payload = {
         type: 'fall_alert',
@@ -119,6 +147,19 @@ export default function HomeScreen() {
     setPeerRouteInfo(null);
   };
 
+  const handleCallAmbulance = async () => {
+    try {
+      // Trigger the SMS logic via backend
+      const userName = profile?.name || 'User';
+      await MockAssistantAPI.callAmbulance(userName);
+      // Also open phone dialer for emergency
+      Linking.openURL('tel:112');
+    } catch (e) {
+      console.warn("Failed to trigger ambulance SMS", e);
+      Linking.openURL('tel:112'); // fallback
+    }
+  };
+
   const triggerAccident = () => {
     setIsAccidentTriggered(true);
     setCountdown(10);
@@ -167,7 +208,10 @@ export default function HomeScreen() {
         try {
           const data = JSON.parse(event.data);
           if (data && data.triggered && data.senderId !== deviceId) {
-            setPeerFallAlert(data);
+            // Ignore incoming peer alerts if we are currently handling our own emergency
+            if (!isAccidentTriggeredRef.current && !isAssistantActiveRef.current) {
+              setPeerFallAlert(data);
+            }
           } else if (data && !data.triggered) {
             setPeerFallAlert(null);
             setPeerRouteInfo(null);
@@ -203,24 +247,301 @@ export default function HomeScreen() {
       }, 1000);
     } else if (isAccidentTriggered && countdown === 0 && !isCancelled) {
       setIsAccidentTriggered(false);
+      
+      // Briefly show ALERT SENT overlay
+      setAlertSent(true);
+      setTimeout(() => setAlertSent(false), 3000);
+      
       setIsAssistantActive(true);
-      startAssistantFlow();
+      // Wait for user to manually press mic button
       reportFallToPeers();
     }
     return () => clearInterval(timer);
   }, [isAccidentTriggered, countdown, isCancelled]);
 
   const startAssistantFlow = async () => {
-    setAssistantMessage("Connecting to AI Emergency Responder...");
+    console.log("[HomeScreen] Initialising Emergency Voice Assistant Flow...");
+    setSteps(null);
+    setCurrentStepIndex(0);
+    setIsRecordingInitial(true);
+    setInitialCountdown(5);
+    setIsPlayingTTS(false);
+    setIsListeningForCommand(false);
+    isListeningLoopActiveRef.current = false;
+    setAssistantMessage("Initialising audio recorder...");
+
+    if (soundRef.current) {
+      try {
+        await soundRef.current.unloadAsync();
+      } catch (e) {}
+      soundRef.current = null;
+    }
+
     try {
       await Audio.requestPermissionsAsync();
-      const response = await MockAssistantAPI.processAudioStream();
-      setAssistantMessage(response.text);
-      if (response.requiresPhoto) {
-        setRequiresPhoto(true);
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+        shouldRouteThroughEarpieceAndroid: false,
+        playThroughEarpieceAndroid: false,
+      });
+
+      // Prepare and start high-quality WAV recording
+      const recording = new Audio.Recording();
+      await recording.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+      recordingRef.current = recording;
+      await recording.startAsync();
+      setAssistantMessage("🎤 Speak now! Tell me your emergency.");
+
+      // Run 5-second countdown timer for triage speech capture
+      let timer = 5;
+      const interval = setInterval(async () => {
+        timer -= 1;
+        setInitialCountdown(timer);
+        if (timer <= 0) {
+          clearInterval(interval);
+          await finishInitialRecordingAndProcess();
+        }
+      }, 1000);
+
+    } catch (e) {
+      console.error("[HomeScreen] Failed to start voice assistant recording:", e);
+      setAssistantMessage("Failed to access voice recording hardware. Please verify permissions.");
+      setIsRecordingInitial(false);
+    }
+  };
+
+  const finishInitialRecordingAndProcess = async () => {
+    try {
+      setAssistantMessage("⏳ Processing emergency speech...");
+      setIsRecordingInitial(false);
+
+      if (!recordingRef.current) return;
+      const recording = recordingRef.current;
+      await recording.stopAndUnloadAsync();
+      const audioUri = recording.getURI();
+      recordingRef.current = null;
+
+      // Disable recording mode to route stream playback through primary loudspeaker
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        shouldRouteThroughEarpieceAndroid: false,
+        playThroughEarpieceAndroid: false,
+      });
+
+      console.log("[HomeScreen] Uploading audio to ResQ API:", audioUri);
+
+      // Call processEmergency endpoint on FastAPI backend
+      const userName = profile?.name || 'User';
+      const response = await MockAssistantAPI.processEmergency(
+        audioUri, 
+        capturedImageUri, 
+        'en-IN',
+        userName
+      );
+      console.log("[HomeScreen] Backend emergency steps received:", response);
+
+      if (response && response.steps && response.steps.length > 0) {
+        setSteps(response.steps);
+        setCurrentStepIndex(0);
+        // Text-to-Speech skipped per request
+        // playStepTTS(response.steps[0], 0);
+      } else {
+        setAssistantMessage("Could not parse emergency guidance. Please end assistant and try again.");
+      }
+    } catch (err) {
+      console.error("[HomeScreen] finishInitialRecordingAndProcess failed:", err);
+      setAssistantMessage("Connection to ResQ API failed. Please ensure the backend is running.");
+    }
+  };
+
+  const playStepTTS = async (text, index) => {
+    // Stop listening loop and reset speaking state to prevent mic feedback
+    isListeningLoopActiveRef.current = false;
+    setIsListeningForCommand(false);
+    setIsPlayingTTS(true);
+
+    if (soundRef.current) {
+      try {
+        await soundRef.current.stopAsync();
+        await soundRef.current.unloadAsync();
+      } catch (e) {}
+      soundRef.current = null;
+    }
+
+    try {
+      // Force audio output to route directly through speakerphone (disable allowsRecordingIOS)
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        shouldRouteThroughEarpieceAndroid: false,
+        playThroughEarpieceAndroid: false,
+      });
+
+      // Build dynamic HTTP streaming URL based on developer machine's resolved host IP
+      const streamUrl = `http://${hostIp}:8000/api/tts_stream?text=${encodeURIComponent(text)}&language_code=en-IN`;
+      console.log(`[HomeScreen] Streaming Step ${index + 1} TTS audio from:`, streamUrl);
+
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: streamUrl },
+        { shouldPlay: true }
+      );
+      soundRef.current = sound;
+
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.didJustFinish) {
+          console.log(`[HomeScreen] Step ${index + 1} speech finished. Activating commands listener...`);
+          setIsPlayingTTS(false);
+          // Trigger loop to listen for commands
+          startCommandListeningLoop(index);
+        }
+      });
+    } catch (e) {
+      console.error("[HomeScreen] playStepTTS streaming failed:", e);
+      setIsPlayingTTS(false);
+      startCommandListeningLoop(index);
+    }
+  };
+
+  const startCommandListeningLoop = async (currentStepIdx) => {
+    if (isListeningLoopActiveRef.current) return;
+    isListeningLoopActiveRef.current = true;
+    setIsListeningForCommand(true);
+
+    console.log("[HomeScreen] Wake words listener active. Say 'Next' or 'Previous'...");
+    let commandToExecute = null;
+
+    try {
+      while (isListeningLoopActiveRef.current) {
+        // 1. Enable Recording Mode (allowsRecordingIOS: true)
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+          shouldRouteThroughEarpieceAndroid: false,
+          playThroughEarpieceAndroid: false,
+        });
+
+        // Record small 2-second snippet
+        const recording = new Audio.Recording();
+        await recording.prepareToRecordAsync({
+          android: {
+            extension: '.wav',
+            outputFormat: Audio.AndroidOutputFormat.MPEG_4,
+            audioEncoder: Audio.AndroidEncoder.AAC,
+            sampleRate: 16000,
+            numberOfChannels: 1,
+            bitRate: 128000,
+          },
+          ios: {
+            extension: '.wav',
+            audioQuality: Audio.IOSAudioQuality.HIGH,
+            sampleRate: 16000,
+            numberOfChannels: 1,
+            bitRate: 128000,
+            linearPCMBitDepth: 16,
+            linearPCMIsBigEndian: false,
+            linearPCMIsFloat: false,
+          },
+          web: {},
+        });
+
+        await recording.startAsync();
+        
+        // Listen window
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+
+        if (!isListeningLoopActiveRef.current) {
+          try {
+            await recording.stopAndUnloadAsync();
+          } catch(e){}
+          break;
+        }
+
+        await recording.stopAndUnloadAsync();
+        const uri = recording.getURI();
+
+        // 2. IMMEDIATELY Disable Recording Mode so audio streams play out of main speakerphone
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: false,
+          playsInSilentModeIOS: true,
+          shouldRouteThroughEarpieceAndroid: false,
+          playThroughEarpieceAndroid: false,
+        });
+
+        // Check command via FastAPI
+        try {
+          const result = await MockAssistantAPI.checkCommand(uri);
+          console.log("[HomeScreen] Wake word result:", result);
+
+          if (result.command === 'next') {
+            console.log("[HomeScreen] 'Next' command detected via voice!");
+            commandToExecute = 'next';
+            break; 
+          } else if (result.command === 'previous') {
+            console.log("[HomeScreen] 'Previous' command detected via voice!");
+            commandToExecute = 'previous';
+            break; 
+          }
+        } catch (err) {
+          console.warn("[HomeScreen] Command upload failed:", err);
+        }
       }
     } catch (e) {
-      setAssistantMessage("Failed to connect to audio service.");
+      console.warn("[HomeScreen] Wake words listening loop exception:", e);
+    } finally {
+      // Guaranteed loop termination states
+      isListeningLoopActiveRef.current = false;
+      setIsListeningForCommand(false);
+
+      // Execute voice navigation command only after background recording is fully closed and the loop has exited
+      if (commandToExecute === 'next') {
+        handleNextStep(currentStepIdx);
+      } else if (commandToExecute === 'previous') {
+        handlePreviousStep(currentStepIdx);
+      }
+    }
+  };
+
+  const handleNextStep = (indexVal = currentStepIndex) => {
+    if (steps && indexVal < steps.length - 1) {
+      const nextIndex = indexVal + 1;
+      setCurrentStepIndex(nextIndex);
+      // playStepTTS(steps[nextIndex], nextIndex);
+    }
+  };
+
+  const handlePreviousStep = (indexVal = currentStepIndex) => {
+    if (steps && indexVal > 0) {
+      const prevIndex = indexVal - 1;
+      setCurrentStepIndex(prevIndex);
+      // playStepTTS(steps[prevIndex], prevIndex);
+    }
+  };
+
+  const endAssistantFlow = async () => {
+    console.log("[HomeScreen] Deactivating emergency assistant...");
+    isListeningLoopActiveRef.current = false;
+    setIsListeningForCommand(false);
+    setIsPlayingTTS(false);
+    setIsRecordingInitial(false);
+    setSteps(null);
+    setCapturedImageUri(null);
+    setIsAssistantActive(false);
+    handleCancelFall();
+
+    if (soundRef.current) {
+      try {
+        await soundRef.current.unloadAsync();
+      } catch (e) {}
+      soundRef.current = null;
+    }
+
+    if (recordingRef.current) {
+      try {
+        await recordingRef.current.stopAndUnloadAsync();
+      } catch (e) {}
+      recordingRef.current = null;
     }
   };
 
@@ -237,19 +558,8 @@ export default function HomeScreen() {
     });
 
     if (!result.canceled) {
-      setAssistantMessage("Analyzing photo...");
-      setRequiresPhoto(false);
-      const analysis = await MockAssistantAPI.analyzePhoto(result.assets[0].uri);
-      setAssistantMessage(analysis.text);
-      
-      if (analysis.escalate) {
-        let location = { coords: { latitude: 33.924, longitude: -117.917 } };
-        try {
-          location = await Location.getCurrentPositionAsync({});
-        } catch(e) { }
-        const escalation = await MockAssistantAPI.evaluateEscalation(location.coords);
-        setEscalationData(escalation);
-      }
+      console.log("[HomeScreen] Camera image captured:", result.assets[0].uri);
+      setCapturedImageUri(result.assets[0].uri);
     }
   };
   
@@ -342,33 +652,181 @@ export default function HomeScreen() {
       )}
 
       {isAssistantActive && !escalationData && (
-        <View style={[styles.accidentOverlay, { backgroundColor: '#1C1C1E', bottom: 0, borderRadius: 0 }]} pointerEvents="box-none">
-          <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24, width: '100%' }}>
-            <Activity color={COLORS.primary} size={64} style={{ marginBottom: 24 }} />
-            <Text style={styles.accidentTitle}>AI RESPONDER</Text>
-            <View style={{ backgroundColor: 'rgba(255,255,255,0.1)', padding: 20, borderRadius: 16, width: '100%', marginBottom: 32 }}>
-              <Text style={{ color: COLORS.textLight, fontSize: 18, textAlign: 'center', lineHeight: 28 }}>
-                {assistantMessage}
-              </Text>
-            </View>
-            
-            {requiresPhoto && (
-              <TouchableOpacity style={styles.cameraBtn} onPress={handleTakePhoto}>
-                <Camera color={COLORS.textLight} size={24} style={{ marginRight: 8 }} />
-                <Text style={styles.cameraBtnText}>Take Photo of Victim</Text>
-              </TouchableOpacity>
-            )}
+        <View style={[styles.accidentOverlay, { backgroundColor: '#121214', bottom: 0, borderRadius: 0 }]} pointerEvents="box-none">
+          {/* 1. INITIAL TRIAGE AND SPEECH CAPTURE SETUP SCREEN */}
+          {steps === null ? (
+            <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24, width: '100%' }}>
+              <Activity color={COLORS.primary} size={48} style={{ marginBottom: 24 }} />
+              <Text style={styles.assistantTriageTitle}>AI EMERGENCY TRIAGE</Text>
+              <Text style={styles.assistantTriageSubtitle}>Provide voice & visual details for rapid instructions</Text>
 
-            <TouchableOpacity 
-              style={[styles.miniSosBtn, { backgroundColor: 'rgba(255,255,255,0.2)', marginTop: 40, paddingHorizontal: 24, paddingVertical: 12 }]} 
-              onPress={() => {
-                setIsAssistantActive(false);
-                handleCancelFall();
-              }}
-            >
-              <Text style={[styles.miniSosText, { fontSize: 16 }]}>End Assistant</Text>
-            </TouchableOpacity>
-          </View>
+              {/* Triage Dashboard Container */}
+              <View style={styles.triageDashboard}>
+                
+                {/* Photo Upload Section */}
+                <View style={styles.triageCard}>
+                  <Text style={styles.triageCardLabel}>1. ATTACH PHOTO (OPTIONAL)</Text>
+                  {capturedImageUri ? (
+                    <View style={styles.photoContainer}>
+                      <Image source={{ uri: capturedImageUri }} style={styles.capturedPhoto} />
+                      <TouchableOpacity style={styles.retakePhotoBtn} onPress={handleTakePhoto}>
+                        <Camera color="#FFFFFF" size={16} style={{ marginRight: 6 }} />
+                        <Text style={styles.retakePhotoBtnText}>Retake</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : (
+                    <TouchableOpacity style={styles.addPhotoBtn} onPress={handleTakePhoto}>
+                      <Camera color={COLORS.primary} size={28} style={{ marginBottom: 8 }} />
+                      <Text style={styles.addPhotoBtnText}>Add Injury Photo</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+
+                {/* Voice Input Section */}
+                <View style={styles.triageCard}>
+                  <Text style={styles.triageCardLabel}>2. STATE SYMPTOMS (5 SECONDS)</Text>
+                  {isRecordingInitial ? (
+                    <View style={styles.recordingCardActive}>
+                      {/* Pulsing indicator */}
+                      <View style={styles.pulsingMicWrapperActive}>
+                        <Mic color="#FFFFFF" size={32} />
+                      </View>
+                      <Text style={styles.recordingCountdown}>{initialCountdown}s remaining</Text>
+                      <Text style={styles.recordingAlertText}>Speak now...</Text>
+                    </View>
+                  ) : (
+                    <TouchableOpacity style={styles.startVoiceBtn} onPress={startAssistantFlow}>
+                      <View style={styles.micCircleInactive}>
+                        <Mic color="#FFFFFF" size={28} />
+                      </View>
+                      <Text style={styles.startVoiceBtnText}>Start Speech Recording</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+
+              </View>
+
+              {/* Status Message Overlay Banner */}
+              <View style={styles.triageStatusBanner}>
+                <Text style={styles.triageStatusBannerText}>{assistantMessage}</Text>
+              </View>
+
+              {/* End / Cancel button */}
+              <TouchableOpacity 
+                style={styles.cancelTriageBtn} 
+                onPress={endAssistantFlow}
+              >
+                <Text style={styles.cancelTriageBtnText}>Cancel Triage</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity 
+                style={[styles.endAssistantBtn, { backgroundColor: '#FF8C00', marginTop: 12 }]} 
+                onPress={handleCallAmbulance}
+              >
+                <Text style={styles.endAssistantBtnText}>Call Ambulance</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            
+            /* 2. PREMIUM VOICE & STEP GUIDANCE SCREEN */
+            <View style={{ flex: 1, padding: 24, width: '100%', justifyContent: 'space-between', paddingTop: 50 }}>
+              
+              {/* Header Info */}
+              <View style={{ alignItems: 'center' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
+                  <View style={styles.glowingActiveDot} />
+                  <Text style={styles.assistantTriageTitle}>AI FIRST-AID RESPONDR</Text>
+                </View>
+                <Text style={styles.assistantTriageSubtitle}>Stay calm. Follow these steps sequentially.</Text>
+              </View>
+
+              {/* Visual Progress Bar Indicator */}
+              <View style={styles.stepProgressContainer}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8, width: '100%' }}>
+                  <Text style={styles.stepCountText}>Step {currentStepIndex + 1} of {steps.length}</Text>
+                  <Text style={styles.stepPercentText}>{Math.round(((currentStepIndex + 1) / steps.length) * 100)}% Complete</Text>
+                </View>
+                <View style={styles.stepProgressBg}>
+                  <View style={[styles.stepProgressFill, { width: `${((currentStepIndex + 1) / steps.length) * 100}%` }]} />
+                </View>
+              </View>
+
+              {/* Glassmorphic Step Guidance Text Card */}
+              <View style={styles.guidanceCard}>
+                <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center' }} showsVerticalScrollIndicator={false}>
+                  <Text style={styles.guidanceText}>{steps[currentStepIndex]}</Text>
+                </ScrollView>
+              </View>
+
+              {/* Pulsing Glowing Mic Icon / Voice Status */}
+              <View style={styles.micStatusContainer}>
+                {isPlayingTTS ? (
+                  <View style={styles.ttsSpeakingContainer}>
+                    <View style={styles.speakingWaveWrapper}>
+                      <Activity color={COLORS.primary} size="small" />
+                    </View>
+                    <Text style={styles.micStatusMessage}>Assistant is speaking...</Text>
+                  </View>
+                ) : isListeningForCommand ? (
+                  <View style={styles.sttListeningContainer}>
+                    <View style={styles.pulsingMicWrapperActiveMini}>
+                      <Mic color="#FFFFFF" size={20} />
+                    </View>
+                    <Text style={styles.micStatusMessageActive}>Listening for 'Next' or 'Previous'...</Text>
+                  </View>
+                ) : (
+                  <Text style={styles.micStatusMessage}>Voice engine idle</Text>
+                )}
+              </View>
+
+              {/* Interactive Manual & Voice Action Controls */}
+              <View style={styles.actionControlsRow}>
+                {/* Previous Step Button */}
+                <TouchableOpacity 
+                  style={[styles.actionBtn, currentStepIndex === 0 && styles.actionBtnDisabled]} 
+                  disabled={currentStepIndex === 0}
+                  onPress={() => handlePreviousStep()}
+                >
+                  <Text style={styles.actionBtnText}>Previous</Text>
+                </TouchableOpacity>
+
+                {/* Repeat TTS Button */}
+                <TouchableOpacity 
+                  style={styles.actionBtnCenter}
+                  // onPress={() => playStepTTS(steps[currentStepIndex], currentStepIndex)}
+                >
+                  <View style={styles.actionBtnCenterInner}>
+                    <Text style={styles.actionBtnCenterText}>Repeat Speech</Text>
+                  </View>
+                </TouchableOpacity>
+
+                {/* Next Step Button */}
+                <TouchableOpacity 
+                  style={[styles.actionBtn, currentStepIndex === steps.length - 1 && styles.actionBtnDisabled]} 
+                  disabled={currentStepIndex === steps.length - 1}
+                  onPress={() => handleNextStep()}
+                >
+                  <Text style={styles.actionBtnText}>Next</Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* End Assistant Button */}
+              <TouchableOpacity 
+                style={styles.endAssistantBtn} 
+                onPress={endAssistantFlow}
+              >
+                <Text style={styles.endAssistantBtnText}>I'm Safe Now · End Guide</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity 
+                style={[styles.endAssistantBtn, { backgroundColor: '#FF8C00', marginTop: 12 }]} 
+                onPress={handleCallAmbulance}
+              >
+                <Text style={styles.endAssistantBtnText}>Call Ambulance</Text>
+              </TouchableOpacity>
+
+            </View>
+          )}
         </View>
       )}
 
@@ -949,15 +1407,13 @@ const styles = StyleSheet.create({
   },
   peerFallOverlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: '#1C1C1E',
+    backgroundColor: '#121214',
     zIndex: 1000,
-    justifyContent: 'center',
-    alignItems: 'center',
   },
   peerFallHeader: {
     alignItems: 'center',
     marginTop: 20,
-    marginBottom: 20,
+    marginBottom: 10,
   },
   peerFallTitle: {
     color: '#FF3B30',
@@ -970,28 +1426,26 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '600',
-    marginTop: 6,
-    textAlign: 'center',
+    marginTop: 8,
   },
   peerFallMapContainer: {
     flex: 1,
+    width: '100%',
     borderRadius: 24,
     overflow: 'hidden',
-    backgroundColor: '#2C2C2E',
-    marginBottom: 20,
-    position: 'relative',
+    marginVertical: 20,
   },
   peerRouteCard: {
     position: 'absolute',
-    bottom: 16,
-    left: 16,
-    right: 16,
+    bottom: 20,
+    left: 20,
+    right: 20,
     backgroundColor: '#1C1C1E',
     borderRadius: 16,
-    padding: 12,
     flexDirection: 'row',
-    justifyContent: 'space-around',
-    elevation: 5,
+    paddingVertical: 16,
+    justifyContent: 'space-evenly',
+    alignItems: 'center',
   },
   peerRouteItem: {
     flexDirection: 'row',
@@ -999,30 +1453,369 @@ const styles = StyleSheet.create({
   },
   peerRouteValue: {
     color: '#FFFFFF',
+    fontSize: 16,
     fontWeight: '700',
-    fontSize: 14,
+    marginLeft: 6,
   },
   peerAcceptBtn: {
+    width: '100%',
     backgroundColor: '#FF3B30',
+    paddingVertical: 18,
     borderRadius: 16,
-    paddingVertical: 16,
     alignItems: 'center',
-    marginBottom: 12,
+    marginBottom: 16,
   },
   peerAcceptBtnText: {
     color: '#FFFFFF',
-    fontSize: 16,
+    fontSize: 18,
     fontWeight: '800',
   },
   peerDismissBtn: {
+    width: '100%',
     backgroundColor: '#2C2C2E',
+    paddingVertical: 18,
     borderRadius: 16,
-    paddingVertical: 14,
     alignItems: 'center',
+    marginBottom: 20,
   },
   peerDismissBtnText: {
     color: '#AEAEB2',
-    fontSize: 14,
+    fontSize: 16,
     fontWeight: '700',
+  },
+  
+  // Voice Assistant Visual Styles
+  assistantTriageTitle: {
+    color: '#FFFFFF',
+    fontSize: 22,
+    fontWeight: '900',
+    letterSpacing: 1,
+  },
+  assistantTriageSubtitle: {
+    color: '#8E8E93',
+    fontSize: 13,
+    fontWeight: '500',
+    marginTop: 4,
+    textAlign: 'center',
+  },
+  triageDashboard: {
+    flexDirection: 'row',
+    gap: 16,
+    width: '100%',
+    height: 240,
+    marginTop: 32,
+    marginBottom: 24,
+  },
+  triageCard: {
+    flex: 1,
+    backgroundColor: '#1C1C1E',
+    borderRadius: 20,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#2C2C2E',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  triageCardLabel: {
+    color: '#AEAEB2',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  photoContainer: {
+    width: '100%',
+    height: 140,
+    borderRadius: 14,
+    overflow: 'hidden',
+    position: 'relative',
+  },
+  capturedPhoto: {
+    width: '100%',
+    height: '100%',
+    resizeMode: 'cover',
+  },
+  retakePhotoBtn: {
+    position: 'absolute',
+    bottom: 8,
+    left: 8,
+    right: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    borderRadius: 8,
+    paddingVertical: 6,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  retakePhotoBtnText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  addPhotoBtn: {
+    flex: 1,
+    width: '100%',
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderStyle: 'dashed',
+    borderColor: '#3A3A3C',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  addPhotoBtnText: {
+    color: '#FF4C4C',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  startVoiceBtn: {
+    flex: 1,
+    width: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  micCircleInactive: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: '#FF4C4C',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 12,
+    shadowColor: '#FF4C4C',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  startVoiceBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  recordingCardActive: {
+    flex: 1,
+    width: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  pulsingMicWrapperActive: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: '#FF3B30',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 8,
+    shadowColor: '#FF3B30',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.8,
+    shadowRadius: 15,
+    elevation: 10,
+  },
+  recordingCountdown: {
+    color: '#FFFFFF',
+    fontSize: 20,
+    fontWeight: '900',
+    marginTop: 8,
+  },
+  recordingAlertText: {
+    color: '#FF4C4C',
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 4,
+  },
+  triageStatusBanner: {
+    width: '100%',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.05)',
+    marginBottom: 32,
+  },
+  triageStatusBannerText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
+    lineHeight: 18,
+  },
+  cancelTriageBtn: {
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  cancelTriageBtnText: {
+    color: '#AEAEB2',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  
+  // Step Screen Layout Rules
+  glowingActiveDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#30D158',
+    marginRight: 8,
+    shadowColor: '#30D158',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.8,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  stepProgressContainer: {
+    width: '100%',
+    marginTop: 20,
+    marginBottom: 20,
+  },
+  stepCountText: {
+    color: '#8E8E93',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  stepPercentText: {
+    color: '#30D158',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  stepProgressBg: {
+    width: '100%',
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: '#2C2C2E',
+    overflow: 'hidden',
+  },
+  stepProgressFill: {
+    height: '100%',
+    borderRadius: 3,
+    backgroundColor: '#30D158',
+  },
+  guidanceCard: {
+    flex: 1,
+    width: '100%',
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+    padding: 24,
+    marginVertical: 12,
+    justifyContent: 'center',
+  },
+  guidanceText: {
+    color: '#FFFFFF',
+    fontSize: 22,
+    fontWeight: '700',
+    textAlign: 'center',
+    lineHeight: 34,
+  },
+  micStatusContainer: {
+    height: 48,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginVertical: 12,
+  },
+  ttsSpeakingContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 122, 255, 0.1)',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+  },
+  speakingWaveWrapper: {
+    marginRight: 8,
+  },
+  sttListeningContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 59, 48, 0.12)',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 59, 48, 0.2)',
+  },
+  pulsingMicWrapperActiveMini: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#FF3B30',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 8,
+  },
+  micStatusMessage: {
+    color: '#AEAEB2',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  micStatusMessageActive: {
+    color: '#FF4C4C',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  actionControlsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    width: '100%',
+    marginVertical: 16,
+  },
+  actionBtn: {
+    width: 90,
+    paddingVertical: 12,
+    borderRadius: 14,
+    backgroundColor: '#2C2C2E',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#3A3A3C',
+  },
+  actionBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  actionBtnDisabled: {
+    opacity: 0.3,
+  },
+  actionBtnCenter: {
+    width: 140,
+    height: 50,
+    borderRadius: 25,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    padding: 2,
+  },
+  actionBtnCenterInner: {
+    flex: 1,
+    borderRadius: 23,
+    backgroundColor: '#121214',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  actionBtnCenterText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  endAssistantBtn: {
+    width: '100%',
+    borderRadius: 16,
+    backgroundColor: '#FF3B30',
+    paddingVertical: 16,
+    alignItems: 'center',
+    marginTop: 12,
+  },
+  endAssistantBtnText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '800',
   },
 });
