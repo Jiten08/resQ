@@ -77,7 +77,6 @@ template = ChatPromptTemplate.from_messages(
                 "MOST CRITICAL RULE: Return your response as a clear, numbered list of steps (e.g. '1. Step one\\n2. Step two'), with one step per line. Do not include introductory or concluding remarks.\n"
                 "CRITICAL RULE: You must transpose and translate this context to address the user directly as 'you'.\n"
                 "CRITICAL RULE 2: You must use this language: {language}.\n"
-                "Tell the user to contact 14416 for mental-health related emergencies only if very necessary.\n"
                 "Tell the user to contact 112 if very necessary for medical emergencies or emergencies which require police or fire responders.\n"
                 "Never say 'the patient should...', instead say 'You need to...'.\n\n"
                 "Context from manual (only use the context if the human input is a medical injury or emergency. If it is not related to the context then ignore it.):\n{context}\n\n"
